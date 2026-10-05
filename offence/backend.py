@@ -46,6 +46,8 @@ class LlamaCpp:
                         raw = line[5:].strip()
                         if raw == b"[DONE]":
                             continue
+                        if stopped:
+                            raise ValueError("Backend data after completion")
                         data = json.loads(raw)
                         if data.get("error"):
                             raise ValueError("Backend inference failed")
@@ -64,8 +66,8 @@ class LlamaCpp:
                             yield {"token_ids": token_ids, "text": text}
                         if data.get("stop") is True:
                             stopped = True
-                if not stopped:
-                    raise ValueError("Backend disconnected without a completion marker")
+                if buffer.strip() or not stopped:
+                    raise ValueError("Backend disconnected without a complete ending")
 
 
 async def batches(source, limit):

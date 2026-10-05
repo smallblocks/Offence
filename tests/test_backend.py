@@ -4,14 +4,15 @@ import pytest
 from offence.backend import LlamaCpp, batches
 
 
-async def test_sse_messages_are_not_assumed_to_be_tokens(monkeypatch):
+@pytest.mark.parametrize('ending', ['', 'data: [DONE]\n\n'])
+async def test_sse_messages_are_not_assumed_to_be_tokens(monkeypatch, ending):
     real_client = httpx.AsyncClient
     async def handle(req):
         if req.url.path == "/tokenize":
             return httpx.Response(200, json={"tokens": [1, 2]})
         return httpx.Response(200, content=(
             'data: {"content":"hello there","tokens":[5,6],"stop":false}\n\n'
-            'data: {"content":"","tokens":[],"stop":true}\n\n'))
+            'data: {"content":"","tokens":[],"stop":true}\n\n' + ending))
     monkeypatch.setattr(httpx, "AsyncClient", lambda **kwargs: real_client(transport=httpx.MockTransport(handle)))
     output = [x async for x in LlamaCpp("http://gpu", 100).stream("hi", 4)]
     assert output == [{"token_ids": [5, 6], "text": "hello there"}]
@@ -95,3 +96,56 @@ async def test_batch_bytes_bounded_independently_of_token_count():
     result = [b async for b in batches(source(), 128)]
     assert len(result) == 4
     assert all(len(canonical(b)) < 129 * 1024 for b in result)
+
+
+@pytest.mark.parametrize('ending', [
+    'data: {"content":"extra","tokens":[7],"stop":false}\n\n',
+    'data: {"content":"","tokens":[],"stop":true}\n\n',
+    'data: {"content":"truncated","tokens":[7]',
+])
+async def test_llamacpp_rejects_data_after_stop_or_incomplete_frame(monkeypatch, ending):
+    real_client = httpx.AsyncClient
+
+    async def handle(req):
+        if req.url.path == '/tokenize':
+            return httpx.Response(200, json={'tokens': [1]})
+        return httpx.Response(200, content=(
+            'data: {"content":"hello","tokens":[5],"stop":false}\n\n'
+            'data: {"content":"","tokens":[],"stop":true}\n\n' + ending))
+
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: real_client(
+        **kwargs, transport=httpx.MockTransport(handle)))
+    with pytest.raises(ValueError):
+        _ = [group async for group in LlamaCpp('http://gpu', 100).stream('hi', 4)]
+
+
+@pytest.mark.parametrize('adapter', ['llamacpp', 'vllm'])
+async def test_backend_stream_close_releases_http_response(monkeypatch, adapter):
+    from offence.backend import Vllm
+    closed = []
+
+    class ResponseStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            if adapter == 'llamacpp':
+                yield b'data: {"content":"hello","tokens":[5],"stop":false}\n\n'
+            else:
+                yield frame().encode()
+            raise AssertionError('Closing the adapter must not request more output')
+
+        async def aclose(self):
+            closed.append(True)
+
+    real_client = httpx.AsyncClient
+
+    async def handle(req):
+        if req.url.path == '/tokenize':
+            return httpx.Response(200, json={'tokens': [1], 'count': 1})
+        return httpx.Response(200, stream=ResponseStream())
+
+    monkeypatch.setattr(httpx, 'AsyncClient', lambda **kwargs: real_client(
+        **kwargs, transport=httpx.MockTransport(handle)))
+    backend = LlamaCpp('http://gpu', 100) if adapter == 'llamacpp' else Vllm('http://gpu', 'fixed-model', 100)
+    stream = backend.stream('hi', 4)
+    assert (await anext(stream))['token_ids']
+    await stream.aclose()
+    assert closed == [True]
