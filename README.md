@@ -42,6 +42,9 @@ The smoke test runs three temporary localhost nodes, discovers peers transitivel
 streams protocol-fixture output, removes a bootstrap node, and restarts another node.
 It does not use GPU inference or real Lightning payments.
 
+For bounded checks against an operator-selected model backend, see
+[backend integration checks](docs/BACKEND-INTEGRATION.md).
+
 ## Run a node
 
 ```sh
