@@ -9,6 +9,7 @@ from urllib.parse import urlsplit
 
 import httpx
 from .crypto import canonical, verify
+from .wire import identity_bytes
 
 log = logging.getLogger(__name__)
 MAX_WIRE = 512 * 1024
@@ -41,10 +42,10 @@ def peer_url(url: str, allowed_private=()):
 async def read_json(response):
     response.raise_for_status()
     data = bytearray()
-    async for block in response.aiter_bytes():
-        data.extend(block)
-        if len(data) > MAX_WIRE:
+    async for block in identity_bytes(response):
+        if len(data) + len(block) > MAX_WIRE:
             raise ValueError("Peer response too large")
+        data.extend(block)
     return json.loads(data)
 
 
@@ -71,7 +72,8 @@ class Discovery:
         proxy = self.config.tor_proxy if urlsplit(endpoint).hostname.endswith(".onion") else None
         if endpoint.split("://", 1)[1].split(":", 1)[0].endswith(".onion") and not proxy:
             raise ValueError("Tor peer requires a configured SOCKS proxy")
-        return httpx.AsyncClient(proxy=proxy, timeout=10, follow_redirects=False, trust_env=False)
+        return httpx.AsyncClient(proxy=proxy, timeout=10, follow_redirects=False, trust_env=False,
+                                 headers={'Accept-Encoding': 'identity'})
 
     async def exchange(self, endpoint, expected=None):
         endpoint = peer_url(endpoint, self.config.allowed_private_peers)
@@ -104,8 +106,13 @@ class Discovery:
                 candidates[ad["body"]["endpoint"]] = ad["signer"]
         items = list(candidates.items())
         random.shuffle(items)
-        # Bootstrap addresses remain replaceable; no one address is required.
-        for endpoint, expected in items[:4]:
+        # Always spend part of each tick on configured seeds. Gossip saturation
+        # cannot starve the owner's independent bootstrap paths.
+        seeds = [(url, None) for url in self.config.seeds]
+        random.shuffle(seeds)
+        selected = seeds[:2]
+        selected += [item for item in items if item[0] not in {s[0] for s in selected}][:4-len(selected)]
+        for endpoint, expected in selected:
             failures, retry = self.backoff.get(endpoint, (0, 0))
             if retry > time.monotonic():
                 continue

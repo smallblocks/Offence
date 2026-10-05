@@ -50,11 +50,10 @@ async def test_read_flood_is_rate_limited_and_schema_not_exposed(tmp_path, confi
     app.state.store.close()
 
 
-def test_fractional_mainnet_price_cannot_bypass_startos_guard():
+def test_fractional_mainnet_rate_retains_precision():
     data = {'lightning':'strike','strike_address':'example@strike.me','allow_seller_claim':True,
             'pricing':{'mode':'sats-per-token','sats_per_token':'0.001847639063708904'}}
-    with pytest.raises(ValueError, match='Fractional'):
-        Config.model_validate(data)
+    assert Config.model_validate(data).pricing.exact_token_price() == '1.847639063708904000'
     data['lightning'] = 'disabled'
     assert Config.model_validate(data).pricing.sats_per_token == '0.001847639063708904'
 

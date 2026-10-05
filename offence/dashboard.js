@@ -18,7 +18,7 @@ function render() {
     const card = element("article", "", "card");
     card.append(element("div", offer.available ? "Advertised available" : "Unavailable", "label"));
     card.append(element("h2", offer.manifest.name));
-    card.append(element("div", `${offer.output_msat_per_token} msat / token`, "metric"));
+    card.append(element("div", `${offer.output_msat_per_token_exact ?? offer.output_msat_per_token} msat / token`, "metric"));
     card.append(element("p", `${offer.manifest.context_tokens.toLocaleString()} context tokens · ${offer.manifest.quantization}`));
     card.append(element("p", `Deadline ${offer.generation_deadline_s}s · Batch ${offer.batch_tokens} tokens`));
     card.append(element("code", ad.signer));

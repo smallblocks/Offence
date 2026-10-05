@@ -15,6 +15,7 @@ from pydantic import Field, model_validator
 
 from .app import bounded_body
 from .client import Buyer
+from .pricing import charge
 from .crypto import Identity
 from .discovery import Discovery, peer_url
 from .gateway import ChatRequest, ManagedStream
@@ -31,11 +32,13 @@ class BuyerSettings(Strict):
     providers: list[str] = Field(default_factory=list, max_length=128)
     trusted_providers: list[str] = Field(default_factory=list, max_length=128)
     strategy: Literal['cheapest', 'fastest', 'preferred-model', 'balanced'] = 'cheapest'
-    privacy: Literal['any', 'trusted-only'] = 'any'
+    privacy: Literal['any', 'trusted-only'] = 'trusted-only'
+    allow_unknown_suppliers: bool = False
     assurance: Literal['required', 'seller-claim', 'lab-unverified'] = 'required'
     wallet: Literal['disabled', 'lnd-regtest', 'lnd-mainnet', 'nwc-mainnet'] = 'disabled'
     wallet_managed_fees: bool = False
     allow_provider_key_release: bool = False
+    allow_prepaid_compute: bool = False
     max_price_msat: int = Field(default=0, ge=0, le=10**9)
     request_limit_msat: int = Field(default=0, ge=0, le=10**12)
     daily_limit_msat: int = Field(default=0, ge=0, le=10**12)
@@ -53,7 +56,7 @@ class BuyerSettings(Strict):
     def coherent(self):
         # Validate identity lists even before a model is selected.
         RoutingPolicy(alias='auto', model_ids=self.model_ids or ['0'*64], providers=self.providers,
-                      trusted_providers=self.trusted_providers, privacy=self.privacy)
+                      trusted_providers=self.trusted_providers, privacy=self.privacy if self.trusted_providers else 'any')
         for origin in self.approved_origins:
             peer_url(origin, self.approved_origins)
         for seed in self.seeds:
@@ -74,8 +77,8 @@ class BuyerSettings(Strict):
             raise ValueError('Configure a wallet before enabling spending')
         if self.max_price_msat and (not self.request_limit_msat or not self.daily_limit_msat):
             raise ValueError('Paid inference requires request and daily limits')
-        if self.max_price_msat and self.max_output_tokens * self.fee_per_batch_msat > self.total_fee_limit_msat:
-            raise ValueError('Fee budget must cover one batch per output token')
+        if self.max_price_msat and (1 if self.allow_prepaid_compute else self.max_output_tokens) * self.fee_per_batch_msat > self.total_fee_limit_msat:
+            raise ValueError('Fee budget must cover the selected payment mode')
         if self.request_limit_msat + self.total_fee_limit_msat > self.daily_limit_msat:
             raise ValueError('Daily limit must cover a request and its fee reservation')
         return self
@@ -85,9 +88,9 @@ class BuyerSettings(Strict):
         return 'offence-v1' if self.wallet in ('lnd-mainnet', 'nwc-mainnet') else 'offence-lab-v1'
 
     def node_config(self):
-        policies = [RoutingPolicy(alias='auto', model_ids=self.model_ids, providers=self.providers,
+        policies = [RoutingPolicy(alias='auto', model_ids=self.model_ids, providers=(self.providers or self.trusted_providers) if not self.allow_unknown_suppliers else self.providers,
             trusted_providers=self.trusted_providers, strategy=self.strategy, privacy=self.privacy,
-            max_output_tokens=self.max_output_tokens, min_context_tokens=self.min_context_tokens)] if self.model_ids else []
+            max_output_tokens=self.max_output_tokens, min_context_tokens=self.min_context_tokens)] if self.model_ids and (self.privacy != 'trusted-only' or self.trusted_providers) else []
         return Config(seeds=self.seeds, allowed_private_peers=self.approved_origins, tor_proxy=self.tor_proxy,
                       gateway=GatewayConfig(policies=policies))
 
@@ -157,11 +160,13 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
 
     def unresolved():
         return any(not p.with_name(p.name.removesuffix('.attempt.json')+'.payment.json').exists()
+                   and not p.with_name(p.name.removesuffix('.attempt.json')+'.failed.json').exists()
                    for p in (directory / 'purchases').glob('*.attempt.json'))
 
     async def refresh():
         async with state['refresh_lock']:
             cfg = state['settings'].node_config()
+            store.protected_signers = set(state['settings'].providers) | set(state['settings'].trusted_providers)
             discovery = Discovery(cfg, identity, store)
             await discovery.tick()
             state['discovery_error'] = discovery.last_error
@@ -176,12 +181,16 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
 
     @asynccontextmanager
     async def lifespan(app):
+        from .spending import recover_stopped
+        recover_stopped(directory / 'purchases')
         try:
             wallet = make_wallet(state['settings'].wallet)
             if wallet:
                 async with asyncio.timeout(45):
                     await wallet.check_network()
                     await Buyer(identity, directory / 'purchases', wallet).reconcile_payments()
+                    from .spending import recover_stopped
+                    recover_stopped(directory / 'purchases')
             state['wallet'], state['wallet_ready'] = wallet, True
             state['client'] = Buyer(identity, directory / 'purchases', wallet)
         except Exception:
@@ -243,6 +252,7 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
         return {'settings': state['settings'].model_dump(), 'agent_key': agent_key,
                 'base_url': f'http://127.0.0.1:{port}/v1', 'wallet_ready': state['wallet_ready'],
                 'nwc_saved': (directory / 'wallet.nwc').exists(),
+                'supplier_credit':state['client'].credit_balances(),
                 'active': len(state['active']), 'known_peers': store.peer_count(identity.public),
                 'discovery_error': state['discovery_error'],
                 'received_tokens': totals[0], 'received_output_msat': totals[1],
@@ -262,7 +272,8 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
             wallet = make_wallet(new.wallet)
             if wallet:
                 for path in (directory / 'purchases').glob('*.attempt.json'):
-                    if path.with_name(path.name.removesuffix('.attempt.json')+'.payment.json').exists():
+                    if (path.with_name(path.name.removesuffix('.attempt.json')+'.payment.json').exists()
+                            or path.with_name(path.name.removesuffix('.attempt.json')+'.failed.json').exists()):
                         continue
                     attempt = json.loads(path.read_text())
                     if (attempt.get('network', 'regtest') != wallet.network
@@ -271,6 +282,8 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
                 async with asyncio.timeout(45):
                     await wallet.check_network()
                     await Buyer(identity, directory / 'purchases', wallet).reconcile_payments()
+                    from .spending import recover_stopped
+                    recover_stopped(directory / 'purchases')
             old = state['wallet']
             private_write(settings_path, new.model_dump_json(indent=2))
             state['settings'], state['wallet'], state['wallet_ready'] = new, wallet, True
@@ -306,6 +319,8 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
             async with asyncio.timeout(45):
                 await wallet.check_network()
                 await Buyer(identity, directory / 'purchases', wallet).reconcile_payments()
+                from .spending import recover_stopped
+                recover_stopped(directory / 'purchases')
             private_write(path, connection)
         except Exception:
             raise HTTPException(412, 'Connection failed. Check mainnet, get_info, pay_invoice and lookup_invoice permissions') from None
@@ -336,6 +351,59 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
             state['changing'] = False
         return {'disconnected': True, 'credential_retained_for_recovery': retained}
 
+    async def recover_outputs():
+        for path in sorted((directory/'purchases').glob('chatcmpl-*.output.json')):
+            saved = json.loads(path.read_text())
+            session = saved.get('supplier_session')
+            if saved.get('complete') or not session:
+                continue
+            credit_path = directory/'purchases'/(session+'.credit.json')
+            if not credit_path.exists():
+                continue
+            credit = json.loads(credit_path.read_text())
+            if credit['pending']:
+                continue
+            # Local routing records, never URLs embedded in supplier output.
+            endpoint = peer_url(credit['endpoint'], state['settings'].approved_origins)
+            if credit['charged_msat']:
+                output = await state['client'].recover_prepaid_output(endpoint, credit['provider'], session,
+                    transport=transport, tor_proxy=state['settings'].tor_proxy if '.onion' in endpoint else None)
+                added_tokens = max(0,output['output_tokens']-saved['output_tokens'])
+                added_msat = max(0,output['spent_msat']-saved['spent_msat'])
+                saved.update(output)
+                # Persist output first. Totals are informational, never a payment
+                # authorization; a crash here must not discard recovered text.
+                saved['compute_charge_msat'] = credit['charged_msat']
+                state['client'].save(path.name, saved)
+                with store.db:
+                    store.db.execute('UPDATE buyer_totals SET tokens=tokens+?,msat=msat+? WHERE id=1',
+                                     (added_tokens,added_msat))
+            else:
+                saved['compute_charge_msat'] = 0
+                state['client'].save(path.name,saved)
+
+    @app.post('/admin/payments/recover')
+    async def recover_payments(request: Request):
+        auth(request, True)
+        if state['active'] or state['changing']:
+            raise HTTPException(409, 'Wait for active purchases before recovery')
+        if not state['wallet'] or not state['wallet_ready']:
+            raise HTTPException(412, 'Connect the original wallet before recovery')
+        state['changing'] = True
+        try:
+            async with asyncio.timeout(45):
+                results = await state['client'].reconcile_payments()
+                credits = await state['client'].recover_credits(state['settings'].approved_origins,
+                    transport=transport, tor_proxy=state['settings'].tor_proxy)
+                await recover_outputs()
+            from .spending import recover_stopped
+            recover_stopped(directory / 'purchases')
+            return {'payments': results, 'credits':credits, 'payments_sent': 0}
+        except Exception:
+            raise HTTPException(502, 'Recovery incomplete; unknown payments remain reserved') from None
+        finally:
+            state['changing'] = False
+
     @app.post('/admin/refresh')
     async def refresh_now(request: Request):
         auth(request, True)
@@ -355,6 +423,7 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
             rows.append({'provider': envelope['signer'], 'endpoint': ad.endpoint, 'network': ad.network,
                 'model_id': offer.manifest.model_id, 'name': offer.manifest.name,
                 'context_tokens': offer.manifest.context_tokens, 'output_msat_per_token': offer.output_msat_per_token,
+                'output_msat_per_token_exact': offer.output_msat_per_token_exact,
                 'max_output_tokens': offer.max_output_tokens, 'available': offer.available,
                 'text_chat': offer.text_chat, 'execution_verified': False,
                 'local_observations': store.route_stats(envelope['signer'], offer.manifest.model_id)})
@@ -379,6 +448,24 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
             'privacy': s.privacy, 'max_price_msat': s.max_price_msat, 'execution_verified': False,
             'capabilities': ['text-chat', 'streaming']}}] if s.model_ids else []}
 
+    @app.get('/v1/purchases')
+    async def purchase_list(request: Request):
+        auth(request)
+        paths = sorted((directory/'purchases').glob('chatcmpl-*.output.json'),
+                       key=lambda path:path.stat().st_mtime, reverse=True)[:128]
+        return {'purchases':[{'id':json.loads(path.read_text())['id']} for path in paths]}
+
+    @app.get('/v1/purchases/{request_id}')
+    async def purchase_output(request_id: str, request: Request):
+        auth(request)
+        import re
+        if not re.fullmatch(r'chatcmpl-[0-9a-f]{32}', request_id):
+            raise HTTPException(404, 'Unknown purchase')
+        path = directory / 'purchases' / (request_id + '.output.json')
+        if not path.exists():
+            raise HTTPException(404, 'Unknown purchase')
+        return json.loads(path.read_text())
+
     @app.post('/v1/chat/completions')
     async def chat(request: Request):
         auth(request)
@@ -386,6 +473,7 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
         if state['changing']:
             raise HTTPException(409, 'Owner is changing the wallet or policy')
         s = state['settings']  # Immutable policy reference for this request.
+        store.protected_signers = set(s.providers) | set(s.trusted_providers)
         if req.model != 'auto' or not s.model_ids:
             raise HTTPException(404, 'Choose models in the buyer app, then use model auto')
         if s.assurance == 'required':
@@ -396,6 +484,8 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
             raise HTTPException(429, 'Buyer concurrency limit reached')
         if sum(len(m.content.encode()) for m in req.messages) > 16384 or req.max_tokens > s.max_output_tokens:
             raise HTTPException(400, 'Request exceeds owner context or output limit')
+        if not s.allow_unknown_suppliers and not (s.providers or s.trusted_providers):
+            raise HTTPException(412, 'Approve supplier keys independently before sending prompts')
         router = Router(s.node_config(), store)
         try:
             route = router.select('auto', req.max_tokens, max_price_msat=s.max_price_msat,
@@ -404,8 +494,8 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
             raise HTTPException(409, 'No supplier satisfies the saved policy; no prompt sent')
         # Bind the ceiling to the selected advertised price, not just a larger owner cap.
         raw = store.db.execute('SELECT envelope FROM peers WHERE signer=?', (route.provider,)).fetchone()[0]
-        price = json.loads(raw)['body']['offer']['output_msat_per_token']
-        amount_limit = req.max_tokens * price
+        advertised_offer = json.loads(raw)['body']['offer']
+        amount_limit = charge(advertised_offer, req.max_tokens)
         if amount_limit > s.request_limit_msat:
             raise HTTPException(412, 'Requested output exceeds the per-request spending cap')
         rid = 'chatcmpl-' + secrets.token_hex(16)
@@ -413,33 +503,37 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
             store.reserve_gateway(rid, req.max_tokens, s.daily_output_tokens)
         except ValueError:
             raise HTTPException(429, 'Daily token reservation limit reached')
-        from .spending import reserve, complete
-        # Mainnet reservations are made in Buyer after quote verification. Regtest gets
-        # the same local app budgeting behavior, without double-reserving mainnet.
-        if amount_limit and s.wallet == 'lnd-regtest':
-            try:
-                reserve(directory / 'purchases', rid, amount_limit, s.total_fee_limit_msat, s.daily_limit_msat)
-            except ValueError:
-                raise HTTPException(429, 'Daily monetary reservation limit reached')
         state['active'].add(rid)
         buyer = state['client']
+        quoted = {}
         source = buyer.run(route.endpoint, route.provider, route.model_id, '', req.max_tokens, amount_limit,
             allow_lab=s.assurance == 'lab-unverified', assurance=s.assurance, transport=transport,
             tor_proxy=s.tor_proxy if '.onion' in route.endpoint else None, detailed=True,
             messages=[m.model_dump() for m in req.messages], fee_limit_msat=s.fee_per_batch_msat,
             total_fee_limit_msat=s.total_fee_limit_msat, daily_limit_msat=s.daily_limit_msat,
-            allow_provider_key_release=s.allow_provider_key_release)
+            allow_provider_key_release=s.allow_provider_key_release,
+            allow_prepaid_compute=s.allow_prepaid_compute, on_quote=quoted.update, funding_limit_msat=s.request_limit_msat)
         started, first_ms, succeeded, released = time.monotonic(), None, False, False
         tokens, spent = 0, 0
+        received = []
         def release():
             nonlocal released
             if not released:
                 released = True
                 state['active'].discard(rid)
-                # A payment failure may be the buyer's wallet or local budget, not
-                # supplier fault. Do not turn ambiguous paid failures into ratings.
-                if succeeded or s.wallet == 'disabled':
-                    store.record_route(route.provider, route.model_id, first_ms, succeeded)
+                # This is a local retry cooldown, not public blame or reputation.
+                # Wallet failures also need a pause instead of repeated attempts.
+                store.record_route(route.provider, route.model_id, first_ms, succeeded)
+        def save_output():
+            buyer.save(rid + '.output.json', {'id': rid, 'partial_output': ''.join(received),
+                'complete': succeeded, 'provider': route.provider, 'model_id': route.model_id,
+                'output_tokens': tokens, 'spent_msat': spent, 'routing_fees_included': False,
+                'supplier_session':quoted.get('session'),
+                'funding_floor_msat':quoted.get('funding_floor_msat'),
+                'funding_max_msat':quoted.get('funding_max_msat'),
+                'funding_usd_per_btc':quoted.get('funding_usd_per_btc'),
+                'minimum_compute_msat':quoted.get('minimum_compute_msat',0),
+                'compute_charge_msat':max(spent,quoted.get('minimum_compute_msat',0)) if succeeded else None})
         async def events():
             nonlocal first_ms, succeeded, tokens, spent
             try:
@@ -448,6 +542,7 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
                         if event['type'] == 'delta':
                             if first_ms is None:
                                 first_ms = int((time.monotonic()-started)*1000)
+                            received.append(event['text'])
                             tokens += event['token_count']
                             spent += event['amount_msat']
                             with store.db:
@@ -455,8 +550,7 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
                                                  (event['token_count'], event['amount_msat']))
                         else:
                             succeeded = True
-                            if amount_limit and s.wallet == 'lnd-regtest':
-                                complete(directory / 'purchases', rid)
+                        save_output()
                         yield event
             finally:
                 release()
@@ -466,7 +560,11 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
         except Exception:
             await stream.aclose()
             release()
-            raise HTTPException(502, 'Purchase could not start; any settled payments remain recorded locally')
+            save_output()
+            return JSONResponse(status_code=502, content={'id':rid, 'partial_output':''.join(received),
+                'error':{'type':'incomplete_delivery','message':'Purchase stopped. Deposits and credit reservations require recovery before retrying.'},
+                'offence':{'output_tokens':tokens,'spent_msat':spent,'compute_charge_msat':None,
+                    'minimum_compute_msat':quoted.get('minimum_compute_msat',0),'complete':False}})
         async def all_events():
             yield first
             async for event in stream:
@@ -505,9 +603,18 @@ def create_buyer_app(directory, port=8787, background=True, transport=None, wall
             return {'id': rid, 'object': 'chat.completion', 'created': created, 'model': 'auto',
                 'choices': [{'index': 0, 'message': {'role': 'assistant', 'content': ''.join(parts)}, 'finish_reason': finish}],
                 'offence': {'provider': route.provider, 'model_id': route.model_id, 'execution_verified': False,
-                            'output_tokens': tokens, 'spent_msat': spent, 'routing_fees_included': False}}
+                            'output_tokens': tokens, 'spent_msat': spent, 'routing_fees_included': False,
+                            'compute_charge_msat':max(spent,quoted.get('minimum_compute_msat',0)),
+                            'minimum_compute_msat':quoted.get('minimum_compute_msat',0)}}
         except Exception:
-            raise HTTPException(502, 'Delivery interrupted; received output remains billed')
+            return JSONResponse(status_code=502, content={
+                'id': rid, 'error': {'type': 'incomplete_delivery',
+                    'message': 'Delivery interrupted. Do not automatically retry billed output.'},
+                'partial_output': ''.join(received),
+                'offence': {'provider': route.provider, 'model_id': route.model_id,
+                    'complete': False, 'output_tokens': tokens, 'spent_msat': spent,
+                    'compute_charge_msat':None, 'minimum_compute_msat':quoted.get('minimum_compute_msat',0),
+                    'routing_fees_included': False}})
         finally:
             release()
     return app

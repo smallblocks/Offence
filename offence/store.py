@@ -58,6 +58,7 @@ class Store:
         self._initialize_token_totals()
         self.max_peers = max_peers
         self.local_signer = None
+        self.protected_signers = set()
         for jid, raw in self.db.execute("SELECT id,result FROM jobs").fetchall():
             result = json.loads(raw)
             if result['state'] in {'queued', 'running'}:
@@ -165,10 +166,14 @@ class Store:
             if row and ad.sequence <= row[0]:
                 return False
             if not row and self.db.execute("SELECT count(*) FROM peers").fetchone()[0] >= self.max_peers:
-                if envelope["signer"] != self.local_signer:
+                # Bounded rotation leaves room for newcomers. Pinning is local
+                # policy, never a trust claim supplied by gossip.
+                protected = self.protected_signers | {self.local_signer}
+                victims = [r[0] for r in self.db.execute('SELECT signer FROM peers ORDER BY expires, RANDOM()')
+                           if r[0] not in protected]
+                if not victims:
                     return False
-                # Remote cache saturation must never suppress our own advertisement.
-                self.db.execute("DELETE FROM peers WHERE signer=(SELECT signer FROM peers WHERE signer!=? ORDER BY expires LIMIT 1)", (self.local_signer,))
+                self.db.execute('DELETE FROM peers WHERE signer=?', (victims[0],))
             self.db.execute("INSERT OR REPLACE INTO peers VALUES (?,?,?,?)",
                             (envelope["signer"], ad.sequence, ad.expires, encoded.decode()))
         return True
@@ -194,7 +199,7 @@ class Store:
         return sum(p.stat().st_size for p in (self.path, Path(str(self.path) + "-wal"))
                    if p.exists()) < self.max_storage_bytes * 3 // 4
 
-    def admit(self, session_id, work, request_limit, work_limit):
+    def admit(self, session_id, work, request_limit, work_limit, buyer=None, quote=None):
         if not self.storage_available():
             raise ValueError("Provider storage admission limit reached")
         now = int(time.time())
@@ -204,6 +209,9 @@ class Store:
             if count >= request_limit or used + work > work_limit:
                 raise ValueError("Provider hourly work limit reached")
             self.db.execute("INSERT INTO admission VALUES (?,?,?)", (session_id, now, work))
+            if quote is not None:
+                self.db.execute("INSERT INTO sessions VALUES (?,?,?,'quoted',?)",
+                                (session_id, buyer, canonical(quote).decode(), now))
 
     def reserve_gateway(self, request_id, tokens, limit):
         if not self.storage_available():
@@ -248,19 +256,43 @@ class Store:
                 raw = self.db.execute("SELECT envelope FROM batches WHERE session=? AND seq=?", (session_id, seq)).fetchone()[0]
                 header = json.loads(raw)["body"]["sealed"]["header"]
                 if header["amount_msat"] <= 0:
-                    raise ValueError("Free output has no payment settlement")
+                    # A prepaid fractional stream can have zero-increment chunks.
+                    # They are paid delivery only when backed by a real credit hold.
+                    batch = json.loads(raw)['body']
+                    prepaid = batch.get('settlement_mode') == 'prepaid-v1'
+                    held = self.db.execute('SELECT used FROM credit_holds WHERE session=?', (session_id,)).fetchone() if prepaid else None
+                    if not held or held[0] <= 0:
+                        raise ValueError("Free output has no payment settlement")
                 self._add_tokens(header["model_id"], paid=header["token_count"])
 
     def unsettled_batches(self, limit=32, offset=0):
         return [(session, seq, json.loads(raw)) for session, seq, raw in self.db.execute(
             "SELECT session,seq,envelope FROM batches WHERE paid=0 AND json_extract(envelope,'$.body.sealed.header.amount_msat')>0 ORDER BY session,seq LIMIT ? OFFSET ?", (limit, offset))]
 
-    def recover(self, session_id, buyer):
+    def recover(self, session_id, buyer, offset=None):
         row = self.db.execute("SELECT buyer,quote,state FROM sessions WHERE id=?", (session_id,)).fetchone()
         if not row or row[0] != buyer:
             raise ValueError("Unknown session")
-        return {"quote": json.loads(row[1]), "state": row[2], "batches": [json.loads(r[0]) for r in
-                self.db.execute("SELECT envelope FROM batches WHERE session=? ORDER BY seq", (session_id,))]}
+        legacy = offset is None
+        if legacy:
+            offset = 0
+        if type(offset) is not int or not 0 <= offset <= 32768:
+            raise ValueError('Invalid recovery offset')
+        batches, size, more = [], 0, False
+        for seq, raw in self.db.execute('SELECT seq,envelope FROM batches WHERE session=? AND seq>=? ORDER BY seq LIMIT 65',
+                                       (session_id,offset)):
+            length = len(raw.encode())
+            if size+length > 256*1024 or len(batches) == 64:
+                more = True
+                break
+            batches.append(json.loads(raw))
+            size += length
+        if more and not batches:
+            raise ValueError('Stored batch exceeds recovery page limit')
+        if more and legacy:
+            raise ValueError('Recovery requires offset pagination')
+        return {'quote':json.loads(row[1]), 'state':row[2], 'batches':batches,
+                'next_offset':offset+len(batches) if more else None}
 
     def receipt(self, envelope):
         body = verify(envelope)

@@ -13,12 +13,20 @@ contains commands, URLs or instructions to ignore previous messages.
 - Fixed operator-configured backend origin and served model. No redirects or
   ambient HTTP proxy environment settings.
 - 512 KiB public request limit and 10-second body deadline; bounded HTTP concurrency
-  and per-source read/write rate; 10-second blocked-send deadline and outer request lifetime.
+  and per-source budgets enforced before body reads and signature verification,
+  including invalid requests; 10-second blocked-send deadline and outer request lifetime.
 - Supplier-selected session, output, generation and payment deadlines. Backend
   streams are explicitly closed on disconnect or failure, releasing local slots.
 - Persistent, global rolling-hour admission quotas across buyer identities and
-  restarts. Each quote conservatively reserves the full offered context capacity
-  as its work allowance. Abandoned quotes do not refund this protection allowance.
+  restarts. Only accepted work reserves the full offered context capacity
+  as its work allowance. Quotes reserve no GPU slots, durable session rows or work
+  allowance. New buyers return signed quote/request pairs, so quote cache churn
+  does not invalidate their acceptance.
+- Persistent supplier-wide hourly funding-attempt budget and one invoice attempt
+  per signed quote. Retries return a saved voucher or fail on an unresolved outcome.
+- Bounded recovery pages; oversized legacy unpaged requests fail explicitly.
+- HTTP compression is rejected before response decoding, including for peers,
+  model backends and receiving wallets.
 - Bounded backend responses, frames, token groups and encrypted batches. Refuse
   missing token IDs, substituted model names, unsupported output and invalid endings.
 - SQLite page cap and storage admission watermark; buyer evidence has a separate
@@ -27,7 +35,7 @@ contains commands, URLs or instructions to ignore previous messages.
   CLI purchases require explicit wallet and assurance choices. Proof-required
   requests fail closed.
 
-Defaults: 2 sessions, 120 admitted quotes per rolling hour, 1,000,000 reserved work
+Defaults: 2 sessions, 120 admitted requests per rolling hour, 1,000,000 reserved work
 tokens per rolling hour, and 128 MiB database cap. Operators should set these for
 the capacity they are willing to donate to free lab testing. A large model context
 can consume the conservative work quota quickly, even for short prompts.
@@ -61,12 +69,17 @@ restricted egress, no host management sockets, and no Lightning secrets.
 
 ## Limits and unresolved gates
 
-Permissionless identities are cheap. Global quotas bound supplier exposure but do
-not guarantee fair access: attackers can exhaust the allowance and deny legitimate
-buyers. Public release needs measured anti-abuse policy and sustained load tests.
+Permissionless identities are cheap. Paid mainnet admission requires confirmed
+prepaid credit. Acceptance atomically reserves the request ceiling and consumes
+a minimum compute reservation charge of one batch, capped by that ceiling.
+Unused allowance returns to the buyer's supplier-local balance, including after
+restart. Quote-only and unfunded acceptance floods cannot reserve GPU resources.
+This does not guarantee fair access against funded attacks or volumetric traffic.
+The minimum is not a measured guarantee of covering long-context prefill cost;
+operators must calibrate prices, work limits and deadlines for their hardware.
+Free lab capacity remains a deliberate donation protected only by resource limits.
 Closing an HTTP stream requests cancellation; only integration with the specific
-runtime can establish how promptly GPU work stops. A runtime may precompute more
-output than has been paid for. Do not claim provider loss is bounded to one token
+runtime can establish how promptly GPU work stops. A runtime may compute beyond the output the buyer ultimately receives. Do not claim provider loss is bounded to one token
 batch. Free lab inference deliberately offers no payment guarantee.
 
 Ciphertext/payment binding, recovery and supplier payment assurance require

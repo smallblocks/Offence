@@ -16,6 +16,7 @@ const offerShape = z.object({
     sources: z.array(z.string()).max(16).optional(),
   }).strict(),
   output_msat_per_token: z.number().int().min(0).max(1000000000),
+  output_msat_per_token_exact: z.string().max(64).regex(/^[0-9]+(?:\.[0-9]+)?$/).nullable().optional(),
   batch_tokens: z.number().int().min(1).max(128).optional(),
   max_output_tokens: z.number().int().min(1).max(32768).optional(),
   generation_deadline_s: z.number().int().min(1).max(3600).optional(),
@@ -155,7 +156,7 @@ const payments = sdk.Action.withInput(
     mode: Value.select({ name: 'Pricing mode', default: 'sats-per-token', values: { 'sats-per-token': 'Sats per token', 'cents-per-kwh': 'US cents per kWh' } }),
     rate: Value.text({ name: 'Price', description: 'Positive decimal in the selected pricing unit.', required: true, default: '0.001' }),
     joules: Value.text({ name: 'Measured joules per output token', description: 'Required for energy pricing. Include prompt processing in your measurement.', required: false, default: null }),
-    exchange: Value.text({ name: 'USD per BTC', description: 'Operator-supplied conversion rate for energy pricing. Update when needed; accepted quotes retain their price.', required: false, default: null }),
+    exchange: Value.text({ name: 'USD per BTC', description: 'Operator-supplied conversion rate for the one-cent prepaid deposit and energy pricing. Update when needed; accepted quotes retain their price.', required: false, default: null }),
   }),
   async () => {
     const config = await configFile.read().once() || {}
@@ -172,10 +173,7 @@ const payments = sdk.Action.withInput(
       return value
     }
     positive(input.rate)
-    // Preserve draft precision without enabling silently rounded token charges.
-    if (input.network !== 'disabled' && input.mode === 'sats-per-token' && /[1-9]/.test((input.rate.split('.')[1] || '').slice(3))) {
-      throw new Error('This price needs fractional-millisatoshi batch billing. Save with Lightning Disabled until that upgrade is installed.')
-    }
+    if (['lnd-mainnet', 'strike'].includes(input.network)) positive(input.exchange)
     if (input.mode === 'cents-per-kwh') { positive(input.joules); positive(input.exchange) }
     const saved = JSON.parse(await walletSecretFile.read().once() || '{}')
     const wallet = { url: input.url?.trim() || saved.url, macaroon: input.macaroon?.trim() || saved.macaroon, certificate: input.certificate?.trim() || saved.certificate, strikeKey: input.strikeKey?.trim() || saved.strikeKey }

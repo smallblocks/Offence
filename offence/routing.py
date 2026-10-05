@@ -1,6 +1,7 @@
 """Buyer-local policy routing. Signed claims are filtered before ranking."""
 import time
 from .crypto import verify
+from .pricing import rate
 from .discovery import peer_url
 from .models import Advertisement, GatewayRoute
 
@@ -29,7 +30,7 @@ class Router:
                 ad = Advertisement.model_validate(verify(envelope))
                 provider, offer = envelope['signer'], ad.offer
                 if (ad.expires <= time.time() or ad.issued > time.time() + 30 or not offer
-                    or not offer.available or not offer.text_chat or offer.output_msat_per_token > max_price_msat
+                    or not offer.available or not offer.text_chat or rate(offer) > max_price_msat
                     or (network is not None and ad.network != network)
                     or provider in excluded or (p.providers and provider not in p.providers)
                     or ((trusted_only or p.privacy == 'trusted-only') and provider not in p.trusted_providers)
@@ -54,7 +55,7 @@ class Router:
                 elif p.strategy == 'preferred-model':
                     rank = (preference, load, failures, latency, provider)
                 elif p.strategy == 'cheapest':
-                    rank = (offer.output_msat_per_token, load, failures, preference, latency, provider)
+                    rank = (rate(offer), load, failures, preference, latency, provider)
                 else:
                     rank = (load, failures, preference, latency, provider)
                 candidates.append((rank, GatewayRoute(alias=alias, endpoint=endpoint, provider=provider,

@@ -22,7 +22,7 @@ def setup(tmp_path, config, manifest, **settings):
     app = create_buyer_app(tmp_path/'buyer', background=False, transport=httpx.ASGITransport(app=provider))
     state = app.state.buyer
     state['settings'] = BuyerSettings(approved_origins=['http://provider'], seeds=[], model_ids=[manifest.model_id],
-        assurance='lab-unverified', max_output_tokens=8, **settings)
+        assurance='lab-unverified', max_output_tokens=8, trusted_providers=[provider.state.provider.identity.public], **settings)
     now = int(time.time())
     ad = provider.state.provider.identity.sign({'type':'advertisement','network':config.network,
         'issued':now,'expires':now+120,'sequence':1,'endpoint':'http://provider',
@@ -146,7 +146,7 @@ async def test_wallet_connection_failure_preserves_policy(tmp_path, config, mani
 def test_paid_price_network_and_latency_filters(tmp_path,config,manifest):
     from offence.store import Store
     store=Store(tmp_path/'routing.sqlite')
-    s=BuyerSettings(seeds=[],model_ids=[manifest.model_id],approved_origins=['http://provider'],strategy='cheapest')
+    s=BuyerSettings(seeds=[],model_ids=[manifest.model_id],approved_origins=['http://provider'],strategy='cheapest', privacy='any', allow_unknown_suppliers=True)
     now=int(time.time()); ids=[]
     for price in [10,20]:
         identity=Identity();ids.append(identity.public)
@@ -188,13 +188,13 @@ async def test_unconfigured_wallet_refuses_paid_quote_before_acceptance(tmp_path
             allow_lab=True,transport=httpx.ASGITransport(app=app)):
             pass
     assert not app.state.provider.active
-    assert app.state.store.evidence()['sessions']=={'quoted':1}
+    assert app.state.store.evidence()['sessions']=={}
 
 async def test_mainnet_mode_budget_and_price_pin_with_simulated_wallet(tmp_path, manifest):
     # ASGI buffers streams, so settlement is auto-confirmed here. The separate
     # real LND smoke covers interactive pay-before-next-batch behavior.
     import hashlib
-    from offence.models import Config,Offer
+    from offence.models import Config,Offer,Pricing
     class Wallet:
         network='mainnet'
         def __init__(self):self.invoices={};self.payments=0
@@ -202,18 +202,20 @@ async def test_mainnet_mode_budget_and_price_pin_with_simulated_wallet(tmp_path,
         async def invoice(self,key,amount,commitment,expiry):
             ph=hashlib.sha256(key).hexdigest();self.invoices[ph]=(key,amount,commitment);return 'test:'+ph
         async def wait(self,*args):return True
+        async def settled(self,*args):return self.payments > 0
         async def pay(self,invoice,ph,amount,commitment,fee):
             key,expected,hashed=self.invoices[ph]
             assert amount==expected and commitment==hashed
             self.payments+=1;return key
     wallet=Wallet()
     cfg=Config(backend='vllm',backend_url='http://fixture',backend_model='fixture',allow_seller_claim=True,
-        lightning='lnd-mainnet',offer=Offer(manifest=manifest,output_msat_per_token=1000,batch_tokens=2))
+        lightning='lnd-mainnet', pricing=Pricing(mode='sats-per-token', sats_per_token='1', usd_per_btc='125000'),
+        offer=Offer(manifest=manifest,output_msat_per_token=1000,batch_tokens=2))
     supplier=create_app(tmp_path/'provider',cfg,wallet=wallet,backend=ChatFixture(),background=False)
     root=tmp_path/'buyer';root.mkdir()
     settings=BuyerSettings(seeds=[],approved_origins=['http://provider'],model_ids=[manifest.model_id],
         wallet='lnd-mainnet',assurance='seller-claim',max_price_msat=1000,request_limit_msat=8000,
-        daily_limit_msat=8000,max_output_tokens=8)
+        daily_limit_msat=8000,max_output_tokens=8,allow_prepaid_compute=True,trusted_providers=[supplier.state.provider.identity.public])
     private_write(root/'buyer-settings.json',settings.model_dump_json())
     app=create_buyer_app(root,background=False,transport=httpx.ASGITransport(app=supplier),wallet_factory=lambda _:wallet)
     now=int(time.time())
@@ -224,13 +226,15 @@ async def test_mainnet_mode_budget_and_price_pin_with_simulated_wallet(tmp_path,
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app),base_url='http://127.0.0.1:8787',
              headers={'Authorization':'Bearer '+(root/'agent.key').read_text()}) as c:
             cfg.offer.output_msat_per_token=2000
+            cfg.offer.output_msat_per_token_exact="2000"
             assert (await c.post('/v1/chat/completions',json=chat())).status_code==502
             assert wallet.payments==0
             # Remove the local failure cooldown before testing a corrected offer.
             with app.state.store.db:app.state.store.db.execute('DELETE FROM routing_stats')
             cfg.offer.output_msat_per_token=1000
+            cfg.offer.output_msat_per_token_exact="1000"
             r=await c.post('/v1/chat/completions',json=chat())
             assert r.status_code==200,r.text
-            assert r.json()['offence']['spent_msat']==5000 and wallet.payments==3
+            assert r.json()['offence']['spent_msat']==5000 and wallet.payments==1
             r=await c.post('/v1/chat/completions',json=chat())
-            assert r.status_code==502 and wallet.payments==3
+            assert r.status_code==502 and wallet.payments==1

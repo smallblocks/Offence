@@ -12,7 +12,9 @@ This is an experimental text-chat client, not a general tool-calling coding harn
    `python3 launch.py` (Windows: `py -3 launch.py`).
 4. The first launch installs pinned dependencies from PyPI into this folder.
    Subsequent launches reuse that environment. The local browser screen opens.
-5. Refresh the graph, select model hashes and set your supplier preferences.
+5. Refresh the graph, select model hashes and approve supplier signing keys verified
+   through an independent channel. The default refuses unknown suppliers. A signed
+   advertisement or low price alone is not evidence of trust.
    Explicitly choose an assurance mode. Requiring proof blocks requests because
    execution proofs are unavailable. Free lab and mainnet use separate networks.
 6. Save the policy. Give your agent the displayed base URL, agent key and model
@@ -32,7 +34,7 @@ All spending defaults to zero. To connect a mainnet wallet:
 2. Paste its private `nostr+walletconnect://` connection into the local app and
    choose **Connect wallet**. This checks access without sending a payment.
 3. Choose the connected wallet, your inference limits in sats, and explicitly
-   accept seller claims and wallet-managed fees. Save to enable purchases.
+   accept seller claims, wallet-managed fees and prepaid compute terms. Save to enable purchases.
 4. Give your agent only its local API key. The browser can close after setup;
    the buyer process must remain running.
 
@@ -64,14 +66,50 @@ still requires that supplier; use `python -m offence.cli recover-hosted-keys` wi
 this app's purchases directory and the chosen endpoint/provider for recovery.
 
 The UI shows sats with up to three decimal places; API amounts are integer
-millisatoshis, where 1,000 msat is one sat. For LND, the request cap covers output
-and the daily cap includes reserved routing fees. LND fee budgets must
-cover one batch per requested output token. Reservations deliberately remain
-conservative, and uncertain purchases keep their reservation. Reconciliation recovers payment
-state but does not automatically release an interrupted session reservation.
+millisatoshis, where 1,000 msat is one sat. Paid mainnet suppliers require prepaid
+compute. Mainnet funding starts at one US cent, rounded up to whole sats using
+the supplier's disclosed USD/BTC snapshot. The deposit is credit, not a flat fee.
+If existing credit is insufficient, funding covers at least that minimum or the
+missing request allowance, whichever is larger. The per-request cap also caps
+funding, and the daily cap must cover the payment before it is sent. The exchange
+snapshot is not an independently verified live market feed. Larger requests can
+require more than one cent; funds remain specific to the selected supplier.
+
+Exact fractional token prices accumulate across chunks. Only the cumulative
+request cost rounds up to a millisatoshi, so chunk size cannot multiply rounding.
+Displayed token rates retain finer precision than settlement amounts. Confirmed
+credit is bound to your buyer signing identity and reserved before GPU admission.
+Acceptance consumes a minimum reservation charge equal to one output batch,
+capped by the request maximum. It applies even if you disconnect or the backend
+fails before producing output. The minimum counts toward subsequent output
+charges, rather than being added to them. This is a compute purchase, not a
+promise to refund every failed generation.
+
+Funding is not a capacity reservation: if a quote expires or admission is busy,
+the deposit remains supplier credit for a later request.
+
+Unused allowance is returned to your balance with that supplier. There is no
+automatic Lightning refund and credit cannot move between suppliers. The local
+UI shows accounted credit and unresolved reservations. Back up your identity and
+purchase records: a lost identity, supplier disappearance or supplier data loss
+can make credit unrecoverable. Only prepay suppliers you choose to trust.
+
+The daily allowance conservatively counts transferred funds and reuse of existing
+credit, with LND fee caps when applicable. Deposits are not reported as output
+charges. Unused quote reservations are released after a stopped request; only
+actual payment exposure and unresolved credit usage remain reserved. Use
+**Recover payment status** to query the original wallet and supplier without
+sending funds. Unknown wallet outcomes never expire merely because time passed.
 No automatic retry or fallback purchase occurs after a failed paid stream.
-Ambiguous paid failures do not count against supplier reputation: the cause may
-be the buyer wallet or a local spending limit.
+Failures trigger a local retry cooldown, not a public accusation against a supplier.
+
+For interrupted non-streaming calls, HTTP 502 includes `partial_output`, a request
+`id` and billing metadata. Retrieve saved text with authenticated
+`GET /v1/purchases/{id}`, including after restarting the buyer.
+`GET /v1/purchases` lists recent local request IDs if a connection failed before
+you received the ID. Owner recovery can retrieve missing prepaid batches and keys
+from the supplier in bounded pages, without paying again. Partial delivery
+is never presented as a complete answer. Streaming errors omit the success marker.
 
 The displayed token total counts verified output received by the local app, not
 proof that a downstream agent consumed it. Output cost excludes routing fees and
@@ -93,7 +131,9 @@ Do not run copies of this directory concurrently on different machines.
 
 The default seed is https://offence.ai. Add other seeds and approve their exact
 DNS/private origins locally. Public IP HTTPS and configured Tor origins follow
-peer validation. A seed is not a mandatory intermediary. Suppliers receive the
+peer validation. A seed is not a mandatory intermediary or a trust authority. Use independent
+introductions when available. Enabling unknown suppliers explicitly permits
+prompt delivery to identities that a malicious seed can fabricate. Suppliers receive the
 context you send; splitting a task does not make that context private.
 
 API: authenticated `GET /v1/models`, `GET /v1/providers`, and

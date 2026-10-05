@@ -10,6 +10,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import httpx
+from .wire import identity_bytes
 from .crypto import b64, unb64
 
 
@@ -44,12 +45,12 @@ class LndRegtest:
                    os.environ["OFFENCE_LND_TLS_CERT_FILE"])
 
     async def call(self, method, path, data=None):
-        async with httpx.AsyncClient(base_url=self.url, headers=self.headers, verify=self.tls,
+        async with httpx.AsyncClient(base_url=self.url, headers={**self.headers, "Accept-Encoding": "identity"}, verify=self.tls,
                                      trust_env=False, timeout=30, follow_redirects=False) as client:
             async with client.stream(method, path, json=data) as response:
                 response.raise_for_status()
                 raw = bytearray()
-                async for block in response.aiter_bytes():
+                async for block in identity_bytes(response):
                     raw.extend(block)
                     if len(raw) > 1024 * 1024:
                         raise ValueError("Wallet response exceeds limit")
@@ -109,13 +110,13 @@ class LndRegtest:
             raise ValueError("Invalid payment hash")
         try:
             async with asyncio.timeout(15):
-                async with httpx.AsyncClient(base_url=self.url, headers=self.headers, verify=self.tls,
+                async with httpx.AsyncClient(base_url=self.url, headers={**self.headers, "Accept-Encoding": "identity"}, verify=self.tls,
                         trust_env=False, timeout=10, follow_redirects=False) as client:
                     async with client.stream("GET", "/v2/router/track/" + quote(base64.urlsafe_b64encode(bytes.fromhex(payment_hash)).decode(), safe=""),
                                              params={"no_inflight_updates": "false"}) as response:
                         response.raise_for_status()
                         buffer = b""
-                        async for chunk in response.aiter_bytes():
+                        async for chunk in identity_bytes(response):
                             buffer += chunk
                             if len(buffer) > 1024 * 1024:
                                 raise ValueError("Payment tracking response exceeded limit")

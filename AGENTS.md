@@ -7,8 +7,11 @@ source-backed network comparison is in docs/RESEARCH.md.
 ## Rules
 
 - No central registry, admission authority, mandatory intermediary, or native asset.
-- Each provider runs complete inference. Charge for delivered output tokens,
-  including tokens delivered before a later failure. Buyers select providers.
+- Each provider runs complete inference. Buyers select providers. Paid mainnet
+  requires prepaid compute and explicit buyer consent to a one-batch minimum
+  reservation charge. Unused allowance stays as supplier-local credit.
+- Fractional rates use exact decimal strings and cumulative msat rounding, never per-token rounding.
+- Paid mainnet funding requires an operator USD/BTC snapshot, whole-sat one-cent minimum, and buyer funding caps.
 - Model manifests identify exact files independently of a hosting website.
 - Model accuracy is a seller claim judged through buyer-local reputation and checks.
 - Execution proof is optional, not a payment prerequisite. Signatures/hashes are not execution proof.
@@ -39,23 +42,24 @@ source-backed network comparison is in docs/RESEARCH.md.
   Plain HTTP is available internally, not on the LAN by default.
 - Run `.venv/bin/python -m pytest` and `npm run check` for relevant changes.
 - Strike provider-key-v1 requires explicit buyer opt-in and supplier availability for key recovery; never claim offline decryption for hosted settlement.
+- Prepaid output keys are private buyer-authenticated records, never public evidence.
+- Recover uncertain wallet outcomes without resending; never release ambiguous payment exposure by age.
 - Hosted keys and sessions survive routine cleanup; preserve the database with the node identity.
 - End sessions using the handoff procedure and replace Current state, max 15 lines.
+- Supplier security clearance requires effective GPU-runtime and network checks;
+  application tests and the Offence container's privileges do not establish GPU isolation.
+
+- GPU runtimes using numeric UIDs may also require named passwd/group entries.
+- JIT runtimes need an executable bounded build directory; Docker tmpfs defaults may block it.
+- Inspect container AutoRemove before relying on stop/rename for rollback preservation.
 
 ## Current state
 
-- Supplier package revision 0.1.0:10 remains the experimental public StartOS release.
-- Buyer supports loopback UI/API, signed discovery, LND and NWC mainnet wallet connection.
-- NWC connects without spending; owner enables budgets and explicitly accepts wallet-managed fees.
-- UI prices are sats; API and storage amounts remain integer msat.
-- Wallet secrets stay local and separate from agent keys; disconnect preserves uncertain-payment recovery.
-- 187 tests and TypeScript pass, including encrypted NWC SDK transport and recovery tests.
-- Buyer runtime audit, privacy scan, fresh macOS install, Linux ARM64 smoke and browser checks pass.
-- Buyer download requires Python 3.12+; live NWC funds and Windows launch remain unvalidated.
-- Buyer release buyer-v0.1.0-alpha.2 and offence.ai download are live with matching checksums.
-- GitHub Actions builds and smoke-tests AMD64/ARM64 Docker images; run 37259879618 passes with both archives uploaded.
-- README and offence.ai explain agent-first buyer access and downloads; paid-marketplace readiness is separate.
-- Node-hosted gateway/jobs remain free-only; paid split jobs and tool calls are unsupported.
-- Public buyer availability does not establish operational readiness of any supplier.
-- Supplier-specific configuration and diagnostics belong in the private operator handoff.
-- Buyer and documentation updates do not sideload supplier installations.
+- Published supplier remains 0.1.0:10; published buyer remains buyer-v0.1.0-alpha.2.
+- Source implements prepaid admission, exact fractional pricing and four audit application fixes.
+- Verification: 244 application tests and TypeScript pass; application changes are undeployed.
+- Supplier security clearance remains incomplete; passing application tests is insufficient.
+- Remaining gates include runtime lifecycle, alternate runtime, dependencies and client authentication.
+- Cold-start isolation and coordinated application deployment remain outstanding.
+- Operational evidence and deployment records remain in ignored .private/ and .startos/.
+- Next: close runtime lifecycle gaps, complete containment checks and review application deployment.

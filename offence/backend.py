@@ -4,6 +4,7 @@ import json
 import os
 
 import httpx
+from .wire import identity_bytes
 
 
 class Fixture:
@@ -19,7 +20,7 @@ class LlamaCpp:
         self.url, self.context_tokens = url.rstrip("/"), context_tokens
 
     async def stream(self, prompt, max_tokens):
-        headers = {}
+        headers = {"Accept-Encoding": "identity"}
         if os.getenv("OFFENCE_BACKEND_API_KEY"):
             headers["Authorization"] = "Bearer " + os.environ["OFFENCE_BACKEND_API_KEY"]
         async with httpx.AsyncClient(timeout=60, trust_env=False, headers=headers,
@@ -34,7 +35,7 @@ class LlamaCpp:
                 buffer = b""
                 total = 0
                 stopped = False
-                async for chunk in response.aiter_bytes():
+                async for chunk in identity_bytes(response):
                     buffer += chunk
                     if len(buffer) > 256 * 1024:
                         raise ValueError("Backend SSE frame too large")
@@ -98,7 +99,7 @@ async def bounded_json(client, path, payload):
     async with client.stream("POST", path, json=payload) as response:
         response.raise_for_status()
         raw = bytearray()
-        async for block in response.aiter_bytes():
+        async for block in identity_bytes(response):
             raw.extend(block)
             if len(raw) > 512 * 1024:
                 raise ValueError("Backend response too large")
@@ -133,7 +134,7 @@ class Vllm:
             async with client.stream("POST", path, json=payload) as response:
                 response.raise_for_status()
                 buffer, total, finished, done = b"", 0, False, False
-                async for block in response.aiter_bytes():
+                async for block in identity_bytes(response):
                     buffer += block
                     if len(buffer) > 256 * 1024:
                         raise ValueError("Backend SSE frame too large")

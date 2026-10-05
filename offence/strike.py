@@ -6,6 +6,7 @@ from decimal import Decimal
 from uuid import UUID, uuid4
 
 import httpx
+from .wire import identity_bytes
 
 
 def strike_address(value):
@@ -37,7 +38,7 @@ class Strike:
         self.address = strike_address(address)
         if not api_key or any(c.isspace() for c in api_key):
             raise ValueError('Missing or invalid Strike API credential')
-        self.headers = {'Authorization': 'Bearer ' + api_key}
+        self.headers = {'Authorization': 'Bearer ' + api_key, 'Accept-Encoding': 'identity'}
         self.transport = transport
 
     @classmethod
@@ -52,7 +53,7 @@ class Strike:
                     # Do not expose remote error bodies, request headers, or credentials.
                     raise ValueError('Strike request failed')
                 raw = bytearray()
-                async for chunk in response.aiter_bytes():
+                async for chunk in identity_bytes(response):
                     raw.extend(chunk)
                     if len(raw) > 256 * 1024:
                         raise ValueError('Strike response exceeds limit')

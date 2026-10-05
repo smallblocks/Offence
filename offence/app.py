@@ -1,4 +1,5 @@
 import asyncio
+from .pricing import rate
 from collections import OrderedDict
 from contextlib import asynccontextmanager, suppress
 import json
@@ -20,6 +21,9 @@ from .store import Store
 
 
 async def bounded_body(request):
+    cached = getattr(request.state, 'offence_verified_body', None)
+    if cached is not None:
+        return cached
     data = bytearray()
     try:
         async with asyncio.timeout(10):
@@ -95,7 +99,6 @@ def create_app(data_dir=None, config=None, wallet=None, backend=None, background
 
     app = FastAPI(title="Offence Lab", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
     from .limits import ResourceLimits
-    app.add_middleware(ResourceLimits)
     app.state.provider, app.state.discovery, app.state.store = provider, discovery, store
     buckets = OrderedDict()
 
@@ -104,9 +107,29 @@ def create_app(data_dir=None, config=None, wallet=None, backend=None, background
         if request.method in {"GET", "POST", "HEAD"}:
             host = request.client.host if request.client else "unknown"
             now = time.monotonic()
-            credits, last = buckets.pop(host, (30.0, now))
-            credits = min(30.0, credits + (now - last) * 2)
-            buckets[host] = (max(0, credits - 1), now)
+            # Quote/discovery floods must not consume delivery and recovery credits
+            # for every buyer sharing a reverse proxy or Tor origin.
+            category = 'quotes' if request.url.path in {'/v1/quote','/v1/credit/fund'} else ('gossip' if request.url.path == '/v1/gossip' else 'delivery')
+            principal = host
+            signed_paths = {'/v1/quote','/v1/stream','/v1/gossip','/v1/receipt',
+                            '/v1/recover','/v1/release-key','/v1/credit/fund','/v1/credit/status'}
+            if request.method == 'POST' and request.url.path in signed_paths:
+                try:
+                    envelope = await bounded_body(request)
+                    verify(envelope)
+                except HTTPException as exc:
+                    return JSONResponse({'detail':exc.detail}, status_code=exc.status_code)
+                except ValueError:
+                    return JSONResponse({'detail':'Invalid signed request'}, status_code=400)
+                request.state.offence_verified_body = envelope
+                principal = envelope['signer']
+            # Authenticated buyer identities do not share a proxy-IP quota.
+            # Sybil resistance comes from prepaid GPU admission, not this bucket.
+            bucket = (principal, category)
+            capacity, refill = (256.0, 128) if principal != host and category == 'delivery' else (30.0, 2)
+            credits, last = buckets.pop(bucket, (capacity, now))
+            credits = min(capacity, credits + (now - last) * refill)
+            buckets[bucket] = (max(0, credits - 1), now)
             if len(buckets) > 4096:
                 buckets.popitem(last=False)
             if credits < 1:
@@ -157,7 +180,7 @@ def create_app(data_dir=None, config=None, wallet=None, backend=None, background
                 model_ids[envelope["signer"]] = mid
                 if model_id and model_id != mid:
                     continue
-                if max_msat is not None and offer["output_msat_per_token"] > max_msat:
+                if max_msat is not None and rate(offer) > max_msat:
                     continue
                 if offer["manifest"]["context_tokens"] < min_context:
                     continue
@@ -189,6 +212,14 @@ def create_app(data_dir=None, config=None, wallet=None, backend=None, background
     async def quote(request: HttpRequest):
         return provider.quote(await bounded_body(request))
 
+    @app.post('/v1/credit/fund')
+    async def fund_credit(request: HttpRequest):
+        return await provider.fund_credit(await bounded_body(request))
+
+    @app.post('/v1/credit/status')
+    async def credit_status(request: HttpRequest):
+        return await provider.credit_status(await bounded_body(request))
+
     @app.post("/v1/stream")
     async def stream(request: HttpRequest):
         quote, req = provider.accept(await bounded_body(request))
@@ -217,9 +248,9 @@ def create_app(data_dir=None, config=None, wallet=None, backend=None, background
         body = verify(envelope)
         if body.get("type") != "recover" or type(body.get("issued")) is not int or abs(body["issued"] - time.time()) > 60:
             raise ValueError("Invalid recovery request")
-        records = store.recover(body["session"], envelope["signer"])
+        records = store.recover(body["session"], envelope["signer"], body.get("offset"))
         return identity.sign({"type": "recovery", "session": body["session"], **records,
-                              "evidence": store.evidence_packages(body["session"])})
+                              "evidence": []})
 
     @app.get("/v1/track-record")
     async def track_record():
@@ -242,4 +273,6 @@ def create_app(data_dir=None, config=None, wallet=None, backend=None, background
 
     from .gateway import install_gateway
     install_gateway(app, config, identity, store, data_dir / "buyer", bounded_body)
+    # Last registered is outermost, including body reads and early rejections.
+    app.add_middleware(ResourceLimits)
     return app

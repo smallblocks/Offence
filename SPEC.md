@@ -84,7 +84,7 @@ Each node can learn peers from operator-configured seeds and a persisted local
 cache. Peers exchange signed advertisements, each with identity, endpoint, monotonically
 increasing sequence, issue time, expiry, optional model offer, and availability.
 Advertisements expire within five minutes. New records cannot roll back a live
-sequence number. The cache is bounded; expired records are removed.
+sequence number. The cache is bounded; expired records are removed and unpinned entries rotate at capacity. Owner-pinned supplier keys are protected from rotation. This does not make gossip Sybil resistant.
 
 The lab uses HTTP request/response gossip with connection timeouts, four candidate
 exchanges per tick, bounded message sizes, jittered selection, and failure backoff.
@@ -109,11 +109,35 @@ creation and simple random selection do not solve Sybil or eclipse attacks.
 
 ## Offers and buyer choice
 
-An offer contains the model manifest, output price in integer msat per token,
+An offer contains the model manifest, an exact decimal-string msat-per-token price,
 maximum output, batch size, context capacity, session deadline, payment timeout,
 availability, and execution proof type. Hardware description is optional and
 self-reported. Output pricing includes the provider's cost of processing the prompt;
 there is no separate input-token charge in the initial profile.
+
+`output_msat_per_token_exact` is the contractual rate when present. The legacy
+integer field is its ceiling, retained for compatibility. Fractional rates require
+explicit buyer capability and prepaid settlement. Quotes bind both fields.
+For N tokens, the output charge is ceil(N * exact rate) millisatoshis. A batch
+charges the difference between the current and previous cumulative totals.
+This preserves the rate regardless of chunk partition, with less than one msat
+rounding per request. Zero-increment prepaid chunks still require private keys.
+
+Mainnet funding uses an explicit operator USD/BTC snapshot in the signed quote.
+The minimum deposit is ceil(1,000,000 / USD-per-BTC) sats, at least one US cent
+at that snapshot, not a nonrefundable fee. If credit is insufficient, fund the
+larger of this minimum and the missing request allowance, rounded to whole sats.
+Existing sufficient credit needs no new payment. Quotes state the maximum
+funding amount separately from the compute ceiling. Buyer request and daily
+limits cover funding before any payment; no implicit budget increase is allowed.
+The exchange snapshot is supplier-provided, not an independently verified live
+market feed. Quotes disclose it, and buyers retain their hard sats limits.
+
+Each signed quote permits at most one funding-invoice attempt. The supplier
+persists the attempt before contacting its wallet, returns the saved voucher on
+retry while the quote is current, and rejects retries with unresolved outcomes.
+A persistent supplier-wide rolling-hour budget covers attempts across identities.
+This budget is separate from GPU admission and reserves no compute capacity.
 
 Search filters include exact model ID, maximum output-token price, and minimum
 context capacity. Latency estimates and track records must distinguish advertised
@@ -125,25 +149,31 @@ New identities start without history; they may compete on price without permissi
 1. Buyer signs a fresh request binding provider, model ID, random nonce, timestamp,
    prompt, maximum output tokens, spending cap, and proof policy.
 2. Provider validates its model offer and capacity, rejects unavailable buyer-required proof,
-   and returns a signed quote valid for 60 seconds. Pricing is frozen in the quote.
+   and returns a signed quote valid for 60 seconds. A quote reserves no GPU capacity or hourly work. Admission occurs at acceptance; availability or offer changes may require a fresh quote.
 3. Buyer verifies provider identity and every budget/model field, then signs an
-   acceptance binding the quote hash. The request cannot be accepted twice.
-4. Provider generates a bounded batch of exact token IDs and associated text.
+   acceptance binding the quote hash. Suppliers advertising `quote-request-v1` accept the original signed request and quote in that acceptance, independent of their temporary quote cache. Admission and the session record are stored together. The request cannot be accepted twice.
+4. For paid mainnet, the buyer explicitly accepts prepaid compute terms. The
+   supplier confirms a funding invoice before admitting work, credits it once to
+   the buyer identity, and atomically reserves the request allowance. Acceptance
+   consumes a minimum charge of one output batch, capped by the request maximum,
+   even if no output is received. Further output charges count toward that minimum.
+   Unused allowance stays as supplier-local credit, not an automatic refund.
+   Prepaid output keys require the buyer's signed retrieval request.
+5. Provider generates a bounded batch of exact token IDs and associated text.
    Network/SSE chunks and characters must never be treated as token counts.
-5. Provider encrypts the batch with a key derived from a fresh payment preimage,
-   binds its header as authenticated data, and obtains a matching invoice if paid.
-6. Provider durably stores the signed encrypted batch before transmitting it.
+6. Provider encrypts and durably stores each batch. Prepaid output uses a private
+   buyer-authenticated key retrieval path; legacy per-batch settlement uses an
+   invoice-bound payment key. Neither publishes paid output keys in evidence.
 7. Buyer checks session, model, request, sequence, previous batch hash, price and
-   cumulative limits, then durably stores ciphertext before payment.
-8. Buyer applies its selected assurance policy. Reputation-based purchases accept
-   signed seller claims without execution proof. Proof-required purchases must
-   verify the complete execution/delivery statement before payment. Never label
-   a reputation-based purchase as cryptographically verified.
-9. Buyer pays the exact invoice, retains its payment result and preimage, decrypts,
-   validates token count, displays output, and signs a receipt.
-10. Provider waits for invoice settlement before releasing the next paid batch.
-    Final completion is a signed end record. Error records do not invalidate earlier
-    delivery. Timeout or disconnect stops further work and limits exposure.
+   cumulative limits, then durably stores the ciphertext before retrieving its key.
+8. Buyer applies its selected assurance policy. Seller claims and reputation do
+   not establish cryptographic execution proof; proof-required requests refuse.
+9. Buyer decrypts, validates token counts, displays output and signs a receipt.
+   In legacy per-batch settlement the buyer pays the exact invoice first. Prepaid
+   output never asks for another per-batch Lightning payment.
+10. A signed end record marks completion. Errors preserve earlier delivery.
+    Unused prepaid reservation returns to the supplier-local balance. Interrupted
+    output and credit state have authenticated, read-only recovery paths.
 
 Only one batch is outstanding per session. Default batch size is eight tokens,
 configurable within 1 to 128. Payment latency and any optional proof latency therefore delay displayed

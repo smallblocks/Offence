@@ -21,7 +21,8 @@ def test_discovery_expiry_replay_and_capacity(tmp_path):
     one, two = Identity(), Identity()
     assert store.ingest(ad(one))
     assert not store.ingest(ad(one))
-    assert not store.ingest(ad(two))
+    assert store.ingest(ad(two))
+    assert store.peers()[0]["signer"] == two.public
     assert store.ingest(ad(one, seq=2))
     with pytest.raises(ValueError):
         store.ingest(ad(one, now=int(time.time()) - 400))

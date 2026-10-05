@@ -35,8 +35,7 @@ def test_quotes_bind_price_model_buyer_and_prevent_replay(config, manifest, tmp_
     _, p, b = setup(tmp_path, config)
     req = request(b, p.identity.public, manifest)
     q = p.quote(req)
-    with pytest.raises(sqlite3.IntegrityError):
-        p.quote(req)
+    assert p.quote(req)['body']['session'] == q['body']['session']
     impostor = Identity()
     with pytest.raises(ValueError):
         accept(p, impostor, q)

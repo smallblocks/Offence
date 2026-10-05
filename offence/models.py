@@ -65,6 +65,14 @@ class Manifest(Strict):
 class Offer(Strict):
     manifest: Manifest
     output_msat_per_token: int = Field(ge=0, le=1_000_000_000)
+    output_msat_per_token_exact: str | None = Field(default=None, max_length=64)
+
+    @model_validator(mode="after")
+    def valid_rate(self):
+        from .pricing import rate
+        rate(self)
+        return self
+
     batch_tokens: int = Field(default=8, ge=1, le=128)
     max_output_tokens: int = Field(default=512, ge=1, le=32768)
     generation_deadline_s: int = Field(default=120, ge=1, le=3600)
@@ -103,6 +111,9 @@ class Request(Strict):
     max_total_msat: int = Field(ge=0, le=10**12)
     proof_policy: Literal["required", "lab-unverified", "seller-claim"] = "required"
     allow_provider_key_release: bool = False
+    allow_prepaid_compute: bool = False
+    fractional_billing: bool = False
+    funding_limit_msat: int = Field(default=0, ge=0, le=10**12)
 
     @model_validator(mode="after")
     def input_shape(self):
@@ -176,9 +187,16 @@ class Pricing(Strict):
         return energy_price(self.cents_per_kwh, self.joules_per_token,
                             self.usd_per_btc)["output_msat_per_token"]
 
+    def exact_token_price(self):
+        from .pricing import energy_price, sats_rate
+        if self.mode == "sats-per-token":
+            return sats_rate(self.sats_per_token)
+        return energy_price(self.cents_per_kwh, self.joules_per_token, self.usd_per_btc)["output_msat_per_token_exact"]
+
     @model_validator(mode="after")
     def valid_price(self):
         self.token_price()
+        self.exact_token_price()
         return self
 
 
@@ -191,6 +209,7 @@ class Config(Strict):
     backend_url: str = ""
     backend_model: str = Field(default="", max_length=256)
     gateway: GatewayConfig = Field(default_factory=GatewayConfig)
+    prepaid_compute: bool = False  # Regtest opt-in; paid mainnet always requires prepayment.
     max_requests_per_hour: int = Field(default=120, ge=1, le=100000)
     max_work_tokens_per_hour: int = Field(default=1000000, ge=1, le=100000000)
     max_storage_mb: int = Field(default=128, ge=16, le=4096)
@@ -207,16 +226,12 @@ class Config(Strict):
 
     @model_validator(mode="after")
     def coherent(self):
-        if self.lightning in {"lnd-mainnet", "strike"} and self.pricing and self.pricing.mode == "sats-per-token":
-            from .pricing import positive
-            price = positive(self.pricing.sats_per_token, "sats per token") * 1000
-            if price != price.to_integral_value():
-                raise ValueError("Fractional-millisatoshi billing is not implemented; retain draft with payments disabled")
         if self.lightning == "strike":
             from .strike import strike_address
             self.strike_address = strike_address(self.strike_address)
         if self.pricing and self.offer:
             self.offer.output_msat_per_token = self.pricing.token_price()
+            self.offer.output_msat_per_token_exact = self.pricing.exact_token_price()
         if self.backend in {"llamacpp", "vllm"}:
             from urllib.parse import urlsplit
             p = urlsplit(self.backend_url)
@@ -234,6 +249,9 @@ class Config(Strict):
             raise ValueError("Mainnet requires explicit seller-claim assurance")
         if self.lightning in {"lnd-mainnet", "strike"} and self.backend == "fixture":
             raise ValueError("Fixture backend cannot receive mainnet payments")
+        if self.offer and self.lightning in {"lnd-mainnet", "strike"}:
+            from .pricing import cent_deposit
+            cent_deposit(self.pricing.usd_per_btc if self.pricing else None)
         return self
 
     @property

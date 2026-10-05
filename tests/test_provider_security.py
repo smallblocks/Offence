@@ -17,28 +17,44 @@ from offence.runtime import prepare
 from offence.store import Store
 
 
+def accept_work(p, manifest):
+    buyer = Identity()
+    req = request(buyer, p.identity.public, manifest)
+    q = p.quote(req)
+    return p.accept(buyer.sign({'type':'accept','session':q['body']['session'],
+        'quote_hash':digest(q),'quote':q,'request':req}))
+
+
 def test_work_quota_survives_restart_and_identity_rotation(tmp_path, config, manifest):
     config.max_work_tokens_per_hour = manifest.context_tokens
     app = create_app(tmp_path, config, background=False)
-    p = app.state.provider
-    p.quote(request(Identity(), p.identity.public, manifest))
+    accept_work(app.state.provider, manifest)
     app.state.store.close()
     app = create_app(tmp_path, config, background=False)
-    p = app.state.provider
     with pytest.raises(ValueError, match='hourly work'):
-        p.quote(request(Identity(), p.identity.public, manifest))
-    assert p.active == 0
+        accept_work(app.state.provider, manifest)
+    assert app.state.provider.active == 0
 
 
-def test_quote_flood_and_full_storage_rejected_before_compute(tmp_path, config, manifest, monkeypatch):
+def test_quote_flood_does_not_reserve_work_or_evict_portable_quote(tmp_path, config, manifest, monkeypatch):
     config.max_requests_per_hour = 1
     p = create_app(tmp_path, config, background=False).state.provider
-    p.quote(request(Identity(), p.identity.public, manifest))
-    with pytest.raises(ValueError, match='hourly work'):
+    buyer = Identity()
+    req = request(buyer, p.identity.public, manifest)
+    q = p.quote(req)
+    for _ in range(200):
         p.quote(request(Identity(), p.identity.public, manifest))
+    assert len(p.pending) == 128 and p.active == 0
+    assert p.store.db.execute('SELECT count(*) FROM admission').fetchone()[0] == 0
+    assert p.store.evidence()['sessions'] == {}
+    p.accept(buyer.sign({'type':'accept','session':q['body']['session'],
+        'quote_hash':digest(q),'quote':q,'request':req}))
+    p.release(q['body']['session'])
+    with pytest.raises(ValueError, match='hourly work'):
+        accept_work(p, manifest)
     monkeypatch.setattr(p.store, 'storage_available', lambda: False)
     with pytest.raises(ValueError, match='storage'):
-        p.quote(request(Identity(), p.identity.public, manifest))
+        accept_work(p, manifest)
 
 
 async def test_disconnect_closes_backend_and_releases_gpu_slot(tmp_path, config, manifest):

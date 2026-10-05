@@ -33,6 +33,7 @@ def main():
     buy.add_argument("--prompt", required=True)
     buy.add_argument("--max-tokens", type=int, default=64)
     buy.add_argument("--max-msat", type=int, default=0)
+    buy.add_argument("--funding-limit-msat", type=int, help="Maximum prepaid funding, defaults to --max-msat; must cover the rounded one-cent deposit")
     buy.add_argument("--fee-limit-msat", type=int, default=1000, help="Maximum routing fee per batch")
     buy.add_argument("--data", type=Path, default=Path("data/buyer"))
     buy.add_argument("--allow-lab-unverified", action="store_true")
@@ -43,6 +44,7 @@ def main():
     buy.add_argument("--total-fee-limit-msat", type=int, default=1000)
     buy.add_argument("--daily-limit-msat", type=int, default=0)
     buy.add_argument("--tor-proxy")
+    buy.add_argument('--allow-prepaid-compute', action='store_true', help='Accept supplier-held credit and the minimum compute reservation charge')
     buy.add_argument('--allow-provider-key-release', action='store_true', help='Accept hosted settlement: recovering paid output requires the supplier online')
     keys = sub.add_parser('recover-hosted-keys', help='Recover paid hosted output from an explicitly chosen supplier; never sends funds')
     keys.add_argument('endpoint')
@@ -52,7 +54,7 @@ def main():
     recover = sub.add_parser("recover-payments", help="Reconcile regtest payments without sending funds")
     recover.add_argument("--lnd-mainnet", action="store_true")
     recover.add_argument("--data", type=Path, default=Path("data/buyer"))
-    price = sub.add_parser("price", help="Convert explicit pricing inputs to integer msat per token")
+    price = sub.add_parser("price", help="Convert pricing inputs to an exact rate and compatibility ceiling")
     modes = price.add_mutually_exclusive_group(required=True)
     modes.add_argument("--sats-per-token")
     modes.add_argument("--cents-per-kwh")
@@ -77,9 +79,9 @@ def main():
                          "size": args.file.stat().st_size, "role": "weights"}])
         print(model.model_dump_json(indent=2))
     elif args.command == "price":
-        from .pricing import energy_price, sats_per_token
+        from .pricing import energy_price, sats_per_token, sats_rate
         if args.sats_per_token is not None:
-            print(json.dumps({"output_msat_per_token": sats_per_token(args.sats_per_token)}))
+            print(json.dumps({"output_msat_per_token": sats_per_token(args.sats_per_token), "output_msat_per_token_exact": sats_rate(args.sats_per_token)}))
         else:
             print(json.dumps(energy_price(args.cents_per_kwh, args.joules_per_token, args.usd_per_btc)))
     elif args.command == 'recover-hosted-keys':
@@ -103,7 +105,7 @@ def main():
             async for text in buyer.run(args.endpoint, args.provider, args.model_id, args.prompt,
                                         args.max_tokens, args.max_msat, args.allow_lab_unverified,
                                         args.fee_limit_msat, tor_proxy=args.tor_proxy, assurance=args.assurance,
-                                        total_fee_limit_msat=args.total_fee_limit_msat, daily_limit_msat=args.daily_limit_msat, allow_provider_key_release=args.allow_provider_key_release):
+                                        total_fee_limit_msat=args.total_fee_limit_msat, daily_limit_msat=args.daily_limit_msat, allow_provider_key_release=args.allow_provider_key_release, allow_prepaid_compute=args.allow_prepaid_compute, funding_limit_msat=args.funding_limit_msat):
                 print(text, end="", flush=True)
             print()
         try:
